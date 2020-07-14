@@ -1,0 +1,3 @@
+kconf hardware watchpoint.cfg
+
+patch 0001-watchpoint-adding-the-monitor-support.patch

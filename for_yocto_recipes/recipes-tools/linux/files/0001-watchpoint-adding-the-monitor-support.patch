@@ -1,0 +1,410 @@
+From 863614d92ed5a34c67f09f46492d9c1bbf4563d3 Mon Sep 17 00:00:00 2001
+From: Jiwei Sun <jiwei.sun@windriver.com>
+Date: Fri, 29 Dec 2017 14:03:29 +0800
+Subject: [PATCH] watchpoint: adding the monitor support
+
+Signed-off-by:Jiwei Sun <jiwei.sun@windriver.com>
+---
+ arch/powerpc/Kconfig             |   5 +
+ arch/powerpc/kernel/Makefile     |   1 +
+ arch/powerpc/kernel/watchpoint.c | 362 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 368 insertions(+)
+ create mode 100644 arch/powerpc/kernel/watchpoint.c
+
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index 6b5a086..84805e1 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -1091,4 +1091,9 @@ source "crypto/Kconfig"
+ config PPC_LIB_RHEAP
+ 	bool
+ 
++config WATCHPOINT
++	tristate "enable watchpoint function"
++	depends on DEBUG_FS
++	default y
++
+ source "arch/powerpc/kvm/Kconfig"
+diff --git a/arch/powerpc/kernel/Makefile b/arch/powerpc/kernel/Makefile
+index c1ebbda..69de1e7 100644
+--- a/arch/powerpc/kernel/Makefile
++++ b/arch/powerpc/kernel/Makefile
+@@ -134,6 +134,7 @@ endif
+ 
+ obj-$(CONFIG_EPAPR_PARAVIRT)	+= epapr_paravirt.o epapr_hcalls.o
+ obj-$(CONFIG_KVM_GUEST)		+= kvm.o kvm_emul.o
++obj-$(CONFIG_WATCHPOINT)	+= watchpoint.o
+ 
+ # Disable GCOV in odd or sensitive code
+ GCOV_PROFILE_prom_init.o := n
+diff --git a/arch/powerpc/kernel/watchpoint.c b/arch/powerpc/kernel/watchpoint.c
+new file mode 100644
+index 0000000..fb5ae2a
+--- /dev/null
++++ b/arch/powerpc/kernel/watchpoint.c
+@@ -0,0 +1,362 @@
++/* Watchpoint module: watch userspace memory for e6500 core
++ *
++ * Copyright (C) 2017 WindRiver
++ *	http://www.windriver.com
++ * Author: Sun Jiwei <jiwei.sun@windriver.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ */
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/smp.h>
++#include <linux/errno.h>
++#include <linux/ptrace.h>
++#include <linux/regset.h>
++#include <linux/tracehook.h>
++#include <linux/elf.h>
++#include <linux/user.h>
++#include <linux/security.h>
++#include <linux/signal.h>
++#include <linux/seccomp.h>
++#include <linux/audit.h>
++#include <linux/delay.h>
++#include <linux/debugfs.h>
++#include <trace/syscall.h>
++#include <linux/hw_breakpoint.h>
++#include <linux/perf_event.h>
++#include <linux/context_tracking.h>
++#include <asm/uaccess.h>
++#include <asm/page.h>
++#include <asm/pgtable.h>
++#include <asm/switch_to.h>
++
++static int set_dbgreg_pid = 0;
++static u64 set_dbgreg_addr1 = 0;
++static u64 set_dbgreg_addr2 = 0;
++static unsigned int set_dbgreg_read = 0;
++static unsigned int set_dbgreg_write = 0;
++static unsigned int set_dbgreg_enable = 0;
++
++static struct dentry *root;
++
++static int ptrace_set_debugreg1(struct task_struct *task, unsigned long addr1,
++		unsigned long addr2, unsigned int mode)
++{
++	if ((addr1 >= TASK_SIZE) || (addr2 >= TASK_SIZE))
++		return -EIO;
++
++	task->thread.debug.dac1 = addr1;
++	task->thread.debug.dac2 = addr2;
++
++	if (task->thread.debug.dac1 == 0) {
++		dbcr_dac(task) &= ~(DBCR_DAC1R | DBCR_DAC1W);
++		if (!DBCR_ACTIVE_EVENTS(task->thread.debug.dbcr0,
++					task->thread.debug.dbcr1)) {
++			task->thread.regs->msr &= ~MSR_DE;
++			task->thread.debug.dbcr0 &= ~DBCR0_IDM;
++		}
++		return 0;
++	}
++
++	/* Read or Write bits must be set */
++	if (!(mode & 0x3U))
++		return -EINVAL;
++
++	/* Set the Internal Debugging flag (IDM bit 1) for the DBCR0
++	   register */
++	task->thread.debug.dbcr0 |= DBCR0_IDM;
++	task->thread.debug.dbcr2 &= ~DBCR2_DAC12MODE;
++	if (addr2) {
++		task->thread.debug.dbcr2 |= DBCR2_DAC12M;
++	}
++
++	/* Check for write and read flags and set DBCR0
++	   accordingly */
++	dbcr_dac(task) &= ~(DBCR_DAC1R|DBCR_DAC1W);
++	if (mode & 0x1UL)
++		dbcr_dac(task) |= DBCR_DAC1R;
++	if (mode & 0x2UL)
++		dbcr_dac(task) |= DBCR_DAC1W;
++	task->thread.regs->msr |= MSR_DE;
++
++	/* If the current was set, we need to update CPU's register */
++	if (current == task) {
++		msleep(1);
++	}
++
++	return 0;
++}
++
++static int set_dbgreg(int pid, unsigned long addr1, unsigned long addr2,
++		unsigned int mode)
++{
++	long ret;
++	struct task_struct *task;
++
++//	rcu_read_lock();
++//	task = //find_task_by_vpid(pid);
++	task = get_pid_task(find_get_pid(pid), PIDTYPE_PID);
++	if (task)
++		get_task_struct(task);
++//	rcu_read_unlock();
++
++	if (!task)
++		return -ESRCH;
++
++	ret = ptrace_set_debugreg1(task, addr1, addr2, mode);
++
++	put_task_struct(task);
++
++	return ret;
++}
++
++static int set_dbgreg_toggle_support(int enable)
++{
++	int ret = 0;
++	if (enable) {
++		unsigned long start_addr, end_addr;
++		unsigned int mode = 0;
++		start_addr = set_dbgreg_addr1;
++		end_addr = set_dbgreg_addr2;
++		if ((end_addr) && (start_addr >= end_addr))
++			return -EINVAL;
++		if (set_dbgreg_read)
++			if (set_dbgreg_read)
++				mode |= 0x1;
++		if (set_dbgreg_write)
++			mode |= 0x2;
++		ret = set_dbgreg(set_dbgreg_pid, start_addr,
++				end_addr, mode);
++	} else {
++		set_dbgreg_addr1 = 0;
++		set_dbgreg_addr2 = 0;
++		set_dbgreg_read = 0;
++		set_dbgreg_write = 0;
++		ret = set_dbgreg(set_dbgreg_pid, 0, 0, 0);
++	}
++
++	return ret;
++}
++
++static ssize_t read_enabled_file_bool(struct file *file,
++		char __user *user_buf, size_t count, loff_t *ppos)
++{
++	char buf[3];
++
++	if (set_dbgreg_enable)
++		buf[0] = '1';
++	else
++		buf[0] = '0';
++	buf[1] = '\n';
++	buf[2] = 0x00;
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, 2);
++}
++
++static ssize_t write_s_enabled_file_bool(struct file *file,
++		const char __user *user_buf, size_t count, loff_t *ppos)
++{
++	char buf[32];
++	size_t buf_size;
++	int error = 0;
++
++	buf_size = min(count, (sizeof(buf)-1));
++	if (copy_from_user(buf, user_buf, buf_size))
++		return -EFAULT;
++
++	buf[buf_size] = '\0';
++	switch (buf[0]) {
++	case 'y':
++	case 'Y':
++	case '1':
++		set_dbgreg_enable = 1;
++		set_dbgreg_addr2 = 0;
++		error = set_dbgreg_toggle_support(set_dbgreg_enable);
++		if (error) {
++			printk("There is a error, please check, ret:%d\n", error);
++			return error;
++		}
++		break;
++	case 'n':
++	case 'N':
++	case '0':
++		set_dbgreg_enable = 0;
++		error = set_dbgreg_toggle_support(set_dbgreg_enable);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static const struct file_operations fops_s_wp = {
++	.read =         read_enabled_file_bool,
++	.write =        write_s_enabled_file_bool,
++	.llseek =       default_llseek,
++};
++
++static ssize_t write_r_enabled_file_bool(struct file *file,
++		const char __user *user_buf, size_t count, loff_t *ppos)
++{
++	char buf[32];
++	size_t buf_size;
++	int error = 0;
++
++	buf_size = min(count, (sizeof(buf)-1));
++	if (copy_from_user(buf, user_buf, buf_size))
++		return -EFAULT;
++
++	buf[buf_size] = '\0';
++	switch (buf[0]) {
++	case 'y':
++	case 'Y':
++	case '1':
++		set_dbgreg_enable = 1;
++		error = set_dbgreg_toggle_support(set_dbgreg_enable);
++		if (error) {
++			printk("There is a error, please check, ret:%d\n", error);
++			return error;
++		}
++		break;
++	case 'n':
++	case 'N':
++	case '0':
++		set_dbgreg_enable = 0;
++		error = set_dbgreg_toggle_support(set_dbgreg_enable);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static const struct file_operations fops_r_wp = {
++	.read =         read_enabled_file_bool,
++	.write =        write_r_enabled_file_bool,
++	.llseek =       default_llseek,
++};
++
++static int __init init_watchpoint(void)
++{
++	struct dentry *single;
++	struct dentry *range;
++	struct dentry *file;
++	unsigned int value = 1;
++	int ret;
++
++	root = debugfs_create_dir("watchpoint", NULL);
++	if (root == NULL) {
++		ret = -ENXIO;
++		goto error;
++	}
++	single = debugfs_create_dir("single_watchpoint", root);
++	if (single == NULL) {
++		ret = -ENXIO;
++		goto error;
++	}
++	range = debugfs_create_dir("range_watchpoint", root);
++	if (range == NULL) {
++		ret = -ENXIO;
++		goto error;
++	}
++
++	file = debugfs_create_u32("pid", S_IRUGO | S_IWUGO, single, &set_dbgreg_pid);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_x64("addr", S_IRUGO | S_IWUGO, single, &set_dbgreg_addr1);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_u32("read", S_IRUGO | S_IWUGO, single, &set_dbgreg_read);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_u32("write", S_IRUGO | S_IWUGO, single, &set_dbgreg_write);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	file = debugfs_create_file("enable", 0600, single,
++			&value, &fops_s_wp);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	file = debugfs_create_u32("pid", S_IRUGO | S_IWUGO,
++			range, &set_dbgreg_pid);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_x64("start_addr", S_IRUGO | S_IWUGO,
++			range, &set_dbgreg_addr1);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_x64("end_addr", S_IRUGO | S_IWUGO,
++			range, &set_dbgreg_addr2);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	file = debugfs_create_u32("read", S_IRUGO | S_IWUGO,
++			range, &set_dbgreg_read);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	file = debugfs_create_u32("write", S_IRUGO | S_IWUGO,
++			range, &set_dbgreg_write);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	file = debugfs_create_file("enable", 0600, range,
++			&value, &fops_r_wp);
++	if (!file) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	return 0;
++
++error:
++	debugfs_remove_recursive(root);
++	return ret;
++}
++module_init(init_watchpoint);
++
++static void __exit cleanup_watchpoint(void)
++{
++	if (root) {
++		debugfs_remove_recursive(root);
++	}
++}
++module_exit(cleanup_watchpoint);
++
++MODULE_LICENSE("GPL");
+-- 
+1.8.3.1
+
